@@ -25,7 +25,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cfreeman/gatt"
 	"github.com/cfreeman/gatt/examples/option"
@@ -46,7 +49,7 @@ func onStateChanged(d gatt.Device, s gatt.State) {
 }
 
 // onPeriphDiscovered is called when a new BLE peripheral is detected by the device.
-func onPeriphDiscovered(p gatt.Peripheral, a *gatt.Advertisement, rssi int, deviceID string) {
+func onPeriphDiscovered(p gatt.Peripheral, a *gatt.Advertisement, rssi int, deviceID string, pPool *peripheralPool) {
 	if strings.ToUpper(p.ID()) != strings.ToUpper(deviceID) {
 		return // This is not the peripheral we're looking for, keep looking.
 	}
@@ -62,13 +65,14 @@ func onPeriphDiscovered(p gatt.Peripheral, a *gatt.Advertisement, rssi int, devi
 	log.Println("INFO:  Manufacturer Data =", a.ManufacturerData)
 	log.Println("INFO:  Service Data      =", a.ServiceData)
 	log.Println()
-
 	// Connect to the peripheral once we have found it.
 	p.Device().Connect(p)
+	// TODO: check error
+	pPool.Add(p.ID())
 }
 
 // onPeriphConnected is called when we connect to a BLE peripheral.
-func onPeriphConnected(p gatt.Peripheral, done chan bool, err error) {
+func onPeriphConnected(p gatt.Peripheral, err error, pPool *peripheralPool) {
 	log.Println("INFO:CONNECTED")
 	log.Println()
 
@@ -85,64 +89,76 @@ func onPeriphConnected(p gatt.Peripheral, done chan bool, err error) {
 		return
 	}
 
-	for _, s := range ss {
-		// Get the heart rate measurement characteristic which is identified by the UUID: \x2a37
-		cs, err := p.DiscoverCharacteristics([]gatt.UUID{gatt.MustParseUUID("2a37")}, s)
-		if err != nil {
-			log.Printf("ERROR: Failed to discover characteristics - %s\n", err)
-			continue
-		}
-
-		for _, c := range cs {
-			// Read the characteristic.
-			if (c.Properties() & gatt.CharRead) != 0 {
-				_, err := p.ReadCharacteristic(c)
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	done, err := pPool.Get(p.ID())
+	if err != nil {
+		log.Printf("ERROR: %s\n", err)
+		return
+	}
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			for _, s := range ss {
+				// Get the heart rate measurement characteristic which is identified by the UUID: \x2a37
+				cs, err := p.DiscoverCharacteristics([]gatt.UUID{gatt.MustParseUUID("2a37")}, s)
 				if err != nil {
-					log.Printf("ERROR: Failed to read characteristic - %s\n", err)
+					log.Printf("ERROR: Failed to discover characteristics - %s\n", err)
 					continue
 				}
-			}
 
-			// Discover the characteristic descriptors.
-			_, err := p.DiscoverDescriptors(nil, c)
-			if err != nil {
-				log.Printf("ERROR: Failed to discover descriptors - %s\n", err)
-				continue
-			}
-
-			// Subscribe to any notifications from the characteristic.
-			if (c.Properties() & (gatt.CharNotify | gatt.CharIndicate)) != 0 {
-
-				err := p.SetNotifyValue(c, func(c *gatt.Characteristic, b []byte, err error) {
-					heartRate := binary.LittleEndian.Uint16(append([]byte(b[1:2]), []byte{0}...))
-					contact := binary.LittleEndian.Uint16(append([]byte(b[0:1]), []byte{0, 0}...))
-
-					// Notify if the HRM has skin contact, and the current measured Heart rate.
-					if contact == 6 || contact == 22 {
-						fmt.Printf("1,%d\n", heartRate)
-					} else {
-						fmt.Printf("0,%d\n", heartRate)
+				for _, c := range cs {
+					// Read the characteristic.
+					if (c.Properties() & gatt.CharRead) != 0 {
+						_, err := p.ReadCharacteristic(c)
+						if err != nil {
+							log.Printf("ERROR: Failed to read characteristic - %s\n", err)
+							continue
+						}
 					}
-				})
 
-				if err != nil {
-					log.Printf("ERROR: Failed to subscribe characteristic - %s\n", err)
-					continue
+					// Discover the characteristic descriptors.
+					_, err := p.DiscoverDescriptors(nil, c)
+					if err != nil {
+						log.Printf("ERROR: Failed to discover descriptors - %s\n", err)
+						continue
+					}
+
+					// Subscribe to any notifications from the characteristic.
+					if (c.Properties() & (gatt.CharNotify | gatt.CharIndicate)) != 0 {
+
+						err := p.SetNotifyValue(c, func(c *gatt.Characteristic, b []byte, err error) {
+							heartRate := binary.LittleEndian.Uint16(append([]byte(b[1:2]), []byte{0}...))
+							contact := binary.LittleEndian.Uint16(append([]byte(b[0:1]), []byte{0, 0}...))
+
+							// Notify if the HRM has skin contact, and the current measured Heart rate.
+							if contact == 6 || contact == 22 {
+								fmt.Printf("1,%d\n", heartRate)
+							} else {
+								fmt.Printf("0,%d\n", heartRate)
+							}
+						})
+
+						if err != nil {
+							log.Printf("ERROR: Failed to subscribe characteristic - %s\n", err)
+							continue
+						}
+					}
+
 				}
+				log.Println()
 			}
-
 		}
-		log.Println()
 	}
 
-	// Wait till we are disconnected from the HRM.
-	<-done
 }
 
 // onPeriphDisconnected is called when a BLE Peripheral is disconnected.
-func onPeriphDisconnected(p gatt.Peripheral, done chan bool, err error) {
+func onPeriphDisconnected(p gatt.Peripheral, err error, pPool *peripheralPool) {
 	log.Println("INFO: Disconnected from BLE peripheral.")
-	close(done)
+	pPool.RemoveAndNotify(p.ID())
 }
 
 // pollHeartRateMonitor connects to the BLE heart rate monitor at deviceID and
@@ -159,29 +175,78 @@ func main() {
 	flag.StringVar(&deviceID, "deviceID", "h", "The ID of the bluetooth heart rate monitor.")
 	flag.Parse()
 
-	done := make(chan bool)
-
 	d, err := gatt.NewDevice(option.DefaultClientOptions...)
 	if err != nil {
 		log.Printf("ERROR: Unable to get bluetooth device.")
 		return
 	}
 
+	pPool := newPeripheralPool()
+
 	// Register handlers.
 	d.Handle(
 		gatt.PeripheralDiscovered(func(p gatt.Peripheral, a *gatt.Advertisement, rssi int) {
-			onPeriphDiscovered(p, a, rssi, deviceID)
+			onPeriphDiscovered(p, a, rssi, deviceID, pPool)
 		}),
 		gatt.PeripheralConnected(func(p gatt.Peripheral, err error) {
-			onPeriphConnected(p, done, err)
+			onPeriphConnected(p, err, pPool)
 		}),
 		gatt.PeripheralDisconnected(func(p gatt.Peripheral, err error) {
-			onPeriphDisconnected(p, done, err)
+			onPeriphDisconnected(p, err, pPool)
 		}),
 	)
 
 	d.Init(onStateChanged)
 
-	// Wait till we are disconnected from the HRM.
-	<-done
+	// Listen for the interrupt signal (Ctrl+C)
+	interruptCh := make(chan os.Signal, 1)
+	signal.Notify(interruptCh, os.Interrupt)
+
+	// Wait till the program is interrupted
+	<-interruptCh
+}
+
+type peripheralPool struct {
+	pool map[string]chan bool
+	mu   sync.Mutex
+}
+
+func newPeripheralPool() *peripheralPool {
+	p := &peripheralPool{}
+	p.pool = make(map[string]chan bool)
+	return p
+}
+
+func (p *peripheralPool) Add(pID string) (<-chan bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.pool[pID]
+	if ok {
+		return nil, fmt.Errorf("peripheralPool.Add: peripheral with the %v ID already exists", pID)
+	}
+	done := make(chan bool)
+	p.pool[pID] = done
+	return done, nil
+}
+
+func (p *peripheralPool) Get(pID string) (<-chan bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	done, ok := p.pool[pID]
+	if !ok {
+		return nil, fmt.Errorf("peripheralPool.Get: peripheral with the %v ID not found", pID)
+	}
+	return done, nil
+}
+
+func (p *peripheralPool) RemoveAndNotify(pID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	done, ok := p.pool[pID]
+	if !ok {
+		return fmt.Errorf("peripheralPool.RemoveAndNotify: peripheral with the %v ID not found", pID)
+	}
+	delete(p.pool, pID)
+	close(done)
+	return nil
 }
