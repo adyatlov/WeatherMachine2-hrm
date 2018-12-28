@@ -65,10 +65,12 @@ func onPeriphDiscovered(p gatt.Peripheral, a *gatt.Advertisement, rssi int, devi
 	log.Println("INFO:  Manufacturer Data =", a.ManufacturerData)
 	log.Println("INFO:  Service Data      =", a.ServiceData)
 	log.Println()
-	// Connect to the peripheral once we have found it.
+	// Connect to the peripheral once we have found it if it's not already connected.
+	_, err := pPool.Add(p.ID())
+	if err != nil {
+		return
+	}
 	p.Device().Connect(p)
-	// TODO: check error
-	pPool.Add(p.ID())
 }
 
 // onPeriphConnected is called when we connect to a BLE peripheral.
